@@ -1,4 +1,19 @@
 """
+run.py — AnalogCoderPro + CircuitSurrogate 통합 버전
+─────────────────────────────────────────────────────
+원본 AnalogCoderPro 로직:
+  1. LLM으로 회로 PySpice 코드 생성
+  2. 실행 → ngspice 시뮬레이션
+  3. 파형 이미지를 VLM으로 디버깅
+  4. BO로 디바이스 파라미터 최적화
+  5. 성공하면 저장
+
+추가된 CircuitSurrogate 로직 (# [SURROGATE] 태그로 표시):
+  A. 시뮬 결과를 DB에 자동 저장 (데이터 축적)
+  B. BO loop에서 ngspice 앞에 GNN surrogate 필터
+  C. LLM 최적화 프롬프트에 GNN bottleneck 힌트 삽입
+
+Usage:
   python run.py --task_id=19 --num_per_task=3 \\
                 --model=claude-sonnet-4-20250514 \\
                 --api_key="sk-..." --base_url="https://api.anthropic.com/v1"
@@ -240,21 +255,23 @@ def extract_netlist_from_output(output_dir: Path) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_generation_prompt(task: dict, template: str) -> list[dict]:
-    """회로 생성 프롬프트 구성."""
-    is_complex = task.get("is_complex", False)
+    """회로 생성 프롬프트 구성. 템플릿 플레이스홀더 치환."""
     system = (
         "You are an expert analog circuit designer. "
         "Generate complete, runnable PySpice Python code for the given circuit specification. "
         "The code must: (1) create the circuit netlist, (2) run ngspice simulation, "
-        "(3) save waveform plots as PNG, (4) print key performance metrics."
+        "(3) save waveform plots as PNG, (4) export netlist.sp, "
+        "(5) print key performance metrics."
     )
-    user_content = template.replace("{TASK_DESCRIPTION}", task.get("description", ""))
-    user_content = user_content.replace("{TASK_ID}", str(task["task_id"]))
-    user_content = user_content.replace("{SPECIFICATIONS}", task.get("specifications", ""))
-
+    user = (
+        template
+        .replace("{TASK_DESCRIPTION}", task.get("description", ""))
+        .replace("{TASK_ID}",          str(task.get("task_id", "")))
+        .replace("{SPECIFICATIONS}",   task.get("specifications", ""))
+    )
     return [
         {"role": "system", "content": system},
-        {"role": "user",   "content": user_content},
+        {"role": "user",   "content": user},
     ]
 
 
@@ -290,15 +307,19 @@ def build_vlm_debug_prompt(
     vlm_template: str,
     prev_code: str,
     sim_output: str,
+    gnn_hint: str = "",          # [SURROGATE] GNN bottleneck 힌트
 ) -> str:
-    """VLM 파형 디버깅 프롬프트."""
+    """VLM 파형 디버깅 프롬프트.
+    템플릿의 {GNN_ANALYSIS} 슬롯에 surrogate hint 삽입.
+    """
+    gnn_block = gnn_hint.strip() if gnn_hint else ""
     return (
-        f"{vlm_template}\n\n"
-        f"## Task\n{task.get('description', '')}\n\n"
-        f"## Specifications\n{task.get('specifications', '')}\n\n"
-        f"## Current Code\n```python\n{prev_code}\n```\n\n"
-        f"## Simulation Output\n```\n{sim_output[:1000]}\n```\n\n"
-        "Analyze the waveform image and suggest specific fixes to meet the specifications."
+        vlm_template
+        .replace("{TASK_DESCRIPTION}", task.get("description", ""))
+        .replace("{SPECIFICATIONS}",   task.get("specifications", ""))
+        .replace("{CURRENT_CODE}",     prev_code)
+        .replace("{SIM_OUTPUT}",       sim_output[:1000])
+        .replace("{GNN_ANALYSIS}",     gnn_block)
     )
 
 
@@ -310,21 +331,24 @@ def build_optimize_prompt(
     param_space: dict,
     gnn_hint: str = "",          # [SURROGATE] GNN bottleneck 힌트
 ) -> list[dict]:
-    """BO 최적화 프롬프트 구성."""
+    """BO 최적화 프롬프트 구성.
+    템플릿의 {GNN_ANALYSIS} 슬롯에 surrogate hint 삽입.
+    """
     system = (
         "You are an expert analog circuit optimizer. "
         "Extract device parameters for Bayesian Optimization from the given circuit code. "
         "Return ONLY a JSON object with parameter names and their current values."
     )
+    # {GNN_ANALYSIS} 슬롯 채우기 — hint 없으면 빈 줄로 대체
+    gnn_block = gnn_hint.strip() if gnn_hint else ""
     user = (
-        f"{optimize_template}\n\n"
-        f"## Task\n{task.get('description', '')}\n\n"
-        f"## Current Circuit Code\n```python\n{current_code}\n```\n\n"
-        f"## Simulation Output\n{sim_output[:500]}\n"
-        + (f"\n{gnn_hint}" if gnn_hint else "") +
-        f"\n\n## Parameter Space\n{json.dumps(param_space, indent=2)}\n\n"
-        "Return JSON with parameter names → values to try next."
+        optimize_template
+        .replace("{CURRENT_CODE}",    current_code)
+        .replace("{SIM_OUTPUT}",      sim_output[:800])
+        .replace("{SPECIFICATIONS}",  task.get("specifications", ""))
+        .replace("{GNN_ANALYSIS}",    gnn_block)
     )
+    user += f"\n\n## Parameter Space\n{json.dumps(param_space, indent=2)}"
     return [
         {"role": "system", "content": system},
         {"role": "user",   "content": user},
@@ -589,7 +613,8 @@ class AnalogCoderProPipeline:
             img_path = str(waveform_imgs[0])
             log.info(f"  [Phase2] VLM 디버깅 round {debug_round+1} | {img_path}")
 
-            vlm_prompt = build_vlm_debug_prompt(task, self.tpl_vlm, code, sim_output)
+            vlm_prompt = build_vlm_debug_prompt(task, self.tpl_vlm, code, sim_output,
+                                                gnn_hint=self._get_gnn_hint(attempt_dir))
             vlm_response = call_vlm(self.client, self.args.model, vlm_prompt, img_path)
             fixed_code   = extract_python_code(vlm_response)
 
@@ -803,6 +828,13 @@ class AnalogCoderProPipeline:
             result["error"] = str(e)
 
         return result
+
+    def _get_gnn_hint(self, attempt_dir: Path) -> str:
+        """[SURROGATE] attempt_dir의 netlist로 GNN hint 생성."""
+        if not self.surrogate:
+            return ""
+        netlist = extract_netlist_from_output(attempt_dir)
+        return self.surrogate.get_bottleneck_hint(netlist) if netlist else ""
 
     def _save_to_surrogate(self, attempt_dir: Path, sim_output: str, task: dict):
         """[SURROGATE] 시뮬 결과를 surrogate DB에 저장."""
